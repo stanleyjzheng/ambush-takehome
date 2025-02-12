@@ -8,3 +8,9 @@ solana-sdk.workspace = true
 solana-client.workspace = true
 rpc_pool = { path = "../rpc_pool" }
 tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+dotenv.workspace = true
+shellexpand.workspace = true
+bs58.workspace = true
+bincode.workspace = true

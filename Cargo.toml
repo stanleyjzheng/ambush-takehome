@@ -17,3 +17,6 @@ dotenv = "0.15.0"
 solana-client = "2.1.13"
 solana-sdk = "2.1.13"
 futures = "0.3.31"
+reqwest = { version = "0.12.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+shellexpand = "3.1.0"
