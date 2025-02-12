@@ -1,0 +1,16 @@
+[features]
+custom-heap = []
+custom-panic = []
+
+[package]
+name = "duplicate-tx-prevention-contract"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = "2.1.13"
+borsh = "1.2.0"
+borsh-derive = "1.2.0"

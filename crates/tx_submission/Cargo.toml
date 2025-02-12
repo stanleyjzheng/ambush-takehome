@@ -1,0 +1,10 @@
+[package]
+name = "tx_submission"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+solana-sdk.workspace = true
+solana-client.workspace = true
+rpc_pool = { path = "../rpc_pool" }
+tokio.workspace = true
