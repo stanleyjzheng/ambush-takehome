@@ -11,3 +11,9 @@ clap.workspace = true
 dotenv.workspace = true
 solana-client.workspace = true
 solana-sdk.workspace = true
+rpc_pool = { path = "../rpc_pool" }
+tokio.workspace = true
+tx_submission = { path = "../tx_submission" }
+axum.workspace = true
+tower.workspace = true
+serde.workspace = true

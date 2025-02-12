@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_client::RpcClient;
@@ -11,7 +12,9 @@ use solana_sdk::{
     signature::{read_keypair_file, Keypair, Signature},
     transaction::Transaction,
 };
+use std::env;
 use std::error::Error;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -50,6 +53,7 @@ struct PriorityFeeResult {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct PriorityFeeLevels {
     min: f64,
     low: f64,
@@ -57,39 +61,6 @@ struct PriorityFeeLevels {
     high: f64,
     very_high: f64,
     unsafe_max: f64,
-}
-
-async fn get_priority_fee(
-    client: &Client,
-    helius_api_key: &str,
-    transaction: &Transaction,
-) -> Result<u64, Box<dyn Error + Send + Sync>> {
-    let transaction_base58 = bs58::encode(bincode::serialize(transaction)?).into_string();
-
-    let request = PriorityFeeRequest {
-        jsonrpc: "2.0".to_string(),
-        id: "helius-example".to_string(),
-        method: "getPriorityFeeEstimate".to_string(),
-        params: vec![PriorityFeeParams {
-            transaction: transaction_base58,
-            options: PriorityFeeOptions {
-                recommended: true,
-                include_all_priority_fee_levels: true,
-            },
-        }],
-    };
-
-    let url = format!("https://mainnet.helius-rpc.com/?api-key={}", helius_api_key);
-    let response: PriorityFeeResponse = client
-        .post(&url)
-        .json(&request)
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    // TODO: adjust high/very high depending on the previous tx results
-    Ok(response.result.priority_fee_levels.high as u64)
 }
 
 /// Creates and signs a transaction with the given instructions, blockhash, and priority fee.
@@ -130,6 +101,39 @@ async fn send_transaction_to_rpc(
     .await?;
 
     result.map_err(|e| e.into())
+}
+
+async fn get_priority_fee(
+    client: &Client,
+    helius_api_key: &str,
+    transaction: &Transaction,
+) -> Result<u64, Box<dyn Error + Send + Sync>> {
+    let transaction_base58 = bs58::encode(bincode::serialize(transaction)?).into_string();
+
+    let request = PriorityFeeRequest {
+        jsonrpc: "2.0".to_string(),
+        id: "placeholder".to_string(),
+        method: "getPriorityFeeEstimate".to_string(),
+        params: vec![PriorityFeeParams {
+            transaction: transaction_base58,
+            options: PriorityFeeOptions {
+                recommended: true,
+                include_all_priority_fee_levels: true,
+            },
+        }],
+    };
+
+    let url = format!("https://mainnet.helius-rpc.com/?api-key={}", helius_api_key);
+    let response: PriorityFeeResponse = client
+        .post(&url)
+        .json(&request)
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    // TODO: adjust high/very high depending on the previous tx results
+    Ok(response.result.priority_fee_levels.high as u64)
 }
 
 async fn spam_transactions(
@@ -188,40 +192,51 @@ async fn spam_transactions(
     }
 }
 
-#[tokio::main]
-async fn main() {
-    dotenv::dotenv().ok();
+pub struct TransactionSubmitter {
+    rpc_pool: Arc<rpc_pool::RpcPool>,
+    helius_api_key: String,
+    keypair: Keypair,
+}
 
-    let helius_api_key =
-        std::env::var("HELIUS_API_KEY").expect("HELIUS_API_KEY must be set in environment");
+impl TransactionSubmitter {
+    pub async fn new(rpc_pool: Arc<rpc_pool::RpcPool>) -> Result<Self> {
+        dotenv::dotenv().ok();
+        let helius_api_key = env::var("HELIUS_API_KEY")?;
+        let keypair_path = shellexpand::tilde("~/.config/solana/id.json").to_string();
+        let keypair = read_keypair_file(&keypair_path)
+            .map_err(|e| anyhow!("Failed to read keypair from {}: {}", keypair_path, e))?;
 
-    let keypair_path = shellexpand::tilde("~/.config/solana/id.json").to_string();
-    let keypair = read_keypair_file(&keypair_path)
-        .expect("Failed to read keypair from ~/.config/solana/id.json");
+        Ok(Self {
+            rpc_pool,
+            helius_api_key,
+            keypair,
+        })
+    }
 
-    let rpc_urls = vec!["https://api.mainnet-beta.solana.com".to_string()];
+    pub async fn submit_transaction(&self, instructions: Vec<Instruction>) -> Result<Signature> {
+        let blockhashes: Vec<Hash> = {
+            let cache = self.rpc_pool.cache.lock().unwrap();
+            cache
+                .get_all()
+                .into_iter()
+                .filter_map(|bh| bh.blockhash.parse().ok())
+                .collect()
+        };
 
-    let primary_rpc = RpcClient::new(rpc_urls[0].clone());
-    let recent_blockhash = primary_rpc
-        .get_latest_blockhash()
-        .expect("Failed to get recent blockhash");
-    let blockhashes = vec![recent_blockhash];
+        let rpc_urls = {
+            let tracker = self.rpc_pool.latency_tracker.lock().unwrap();
+            tracker.get_sorted_rpcs()
+        };
 
-    let instructions: Vec<Instruction> = vec![];
-    let timeout_duration = Duration::from_secs(10);
-
-    if let Some(signature) = spam_transactions(
-        rpc_urls,
-        blockhashes,
-        &keypair,
-        instructions,
-        timeout_duration,
-        &helius_api_key,
-    )
-    .await
-    {
-        println!("Transaction landed with signature: {}", signature);
-    } else {
-        println!("Transaction was not confirmed within the timeout period.");
+        spam_transactions(
+            rpc_urls,
+            blockhashes,
+            &self.keypair,
+            instructions,
+            Duration::from_secs(30),
+            &self.helius_api_key.clone(),
+        )
+        .await
+        .ok_or_else(|| anyhow!("Submission timeout"))
     }
 }

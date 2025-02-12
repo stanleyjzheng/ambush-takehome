@@ -10,7 +10,3 @@ env_logger.workspace = true
 solana-client.workspace = true
 solana-sdk.workspace = true
 futures.workspace = true
-
-[[bin]]
-name = "rpc_pool"
-path = "src/main.rs"

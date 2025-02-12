@@ -1,41 +1,115 @@
-use anyhow::{anyhow, Result};
+use axum::{
+    extract::State as AxumState,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use clap::Parser;
-use dotenv::dotenv;
-use solana_client::rpc_client::RpcClient;
-use std::env;
+use serde::{Deserialize, Serialize};
+use solana_sdk::instruction::Instruction;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
-#[derive(Debug, Parser)]
-#[command(version, about, long_about = None)]
-pub struct SendTransactionArgs {
-    #[arg(long, help = "Base58 encoded transaction to send")]
-    transaction: String,
+#[derive(Parser)]
+struct CliArgs {
+    #[clap(short, long, default_value_t = 3000)]
+    port: u16,
 }
 
-impl SendTransactionArgs {
-    pub fn process(&self, client: &RpcClient) -> Result<()> {
-        let bytes = bs58::decode(&self.transaction)
-            .into_vec()
-            .map_err(|_| anyhow!("Failed to decode base58 transaction"))?;
-
-        let transaction = bincode::deserialize::<solana_sdk::transaction::Transaction>(&bytes)
-            .map_err(|e| anyhow!("Invalid transaction data: {}", e))?;
-
-        let signature = client
-            .send_transaction(&transaction)
-            .map_err(|e| anyhow!("Transaction failed to send: {:?}", e))?;
-
-        println!("Transaction sent with signature: {}", signature);
-
-        Ok(())
-    }
+#[derive(Clone)]
+struct AppState {
+    tx_submitter: Arc<tx_submission::TransactionSubmitter>,
 }
 
-fn main() -> Result<()> {
-    dotenv().ok();
+#[derive(Serialize)]
+struct SubmitTransactionResponse {
+    signature: String,
+}
 
-    let rpc_url = env::var("RPC_URL").unwrap();
-    let client = RpcClient::new(rpc_url);
+#[derive(Deserialize)]
+struct AccountMetaRequest {
+    pubkey: String,
+    is_signer: bool,
+    is_writable: bool,
+}
 
-    let args = SendTransactionArgs::parse();
-    args.process(&client)
+#[derive(Deserialize)]
+struct SubmitTransactionRequest {
+    program_id: String,
+    accounts: Vec<AccountMetaRequest>,
+    data: Vec<u8>,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
+    dotenv::dotenv().ok();
+    let args = CliArgs::parse();
+
+    let rpc_pool = Arc::new(rpc_pool::RpcPool::new().await);
+    let tx_submitter = Arc::new(tx_submission::TransactionSubmitter::new(rpc_pool).await?);
+
+    let app = Router::new()
+        .route("/health", get(health_check))
+        .route("/submit", post(handle_submit_transaction))
+        .with_state(AppState { tx_submitter });
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+async fn health_check() -> impl IntoResponse {
+    (StatusCode::OK, "OK")
+}
+
+async fn handle_submit_transaction(
+    AxumState(state): AxumState<AppState>,
+    Json(payload): Json<SubmitTransactionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let program_id = payload.program_id.parse().map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid program ID: {}", e),
+        )
+    })?;
+
+    let accounts = payload
+        .accounts
+        .into_iter()
+        .map(|acc| {
+            acc.pubkey
+                .parse()
+                .map(|pubkey| solana_sdk::instruction::AccountMeta {
+                    pubkey,
+                    is_signer: acc.is_signer,
+                    is_writable: acc.is_writable,
+                })
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("Invalid account pubkey: {}", e),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let instruction = Instruction {
+        program_id,
+        accounts,
+        data: payload.data,
+    };
+
+    state
+        .tx_submitter
+        .submit_transaction(vec![instruction])
+        .await
+        .map(|sig| {
+            Json(SubmitTransactionResponse {
+                signature: sig.to_string(),
+            })
+        })
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
