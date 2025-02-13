@@ -1,4 +1,5 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+use cached::proc_macro::cached;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_client::RpcClient;
@@ -14,6 +15,8 @@ use solana_sdk::{
 };
 use std::env;
 use std::error::Error;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -36,7 +39,6 @@ struct PriorityFeeParams {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PriorityFeeOptions {
-    recommended: bool,
     include_all_priority_fee_levels: bool,
 }
 
@@ -70,6 +72,7 @@ async fn create_transaction_with_priority_fee(
     blockhash: Hash,
     priority_fee: u64,
 ) -> Transaction {
+    println!("instructions {:?}", instructions);
     // Add compute budget instruction for priority fee
     let mut final_instructions = vec![ComputeBudgetInstruction::set_compute_unit_price(
         priority_fee,
@@ -103,11 +106,17 @@ async fn send_transaction_to_rpc(
     result.map_err(|e| e.into())
 }
 
+#[cached(
+    result = true,
+    time = 300,
+    key = "String", // Key is a String (base58 transaction)
+    convert = r#"{ bs58::encode(bincode::serialize(transaction)?).into_string().clone() }"#
+)]
 async fn get_priority_fee(
     client: &Client,
     helius_api_key: &str,
     transaction: &Transaction,
-) -> Result<u64, Box<dyn Error + Send + Sync>> {
+) -> Result<u64> {
     let transaction_base58 = bs58::encode(bincode::serialize(transaction)?).into_string();
 
     let request = PriorityFeeRequest {
@@ -117,23 +126,51 @@ async fn get_priority_fee(
         params: vec![PriorityFeeParams {
             transaction: transaction_base58,
             options: PriorityFeeOptions {
-                recommended: true,
                 include_all_priority_fee_levels: true,
             },
         }],
     };
 
     let url = format!("https://mainnet.helius-rpc.com/?api-key={}", helius_api_key);
-    let response: PriorityFeeResponse = client
+
+    let response_text = client
         .post(&url)
         .json(&request)
         .send()
         .await?
-        .json()
+        .text()
         .await?;
 
-    // TODO: adjust high/very high depending on the previous tx results
-    Ok(response.result.priority_fee_levels.high as u64)
+    let response: PriorityFeeResponse = serde_json::from_str(&response_text)
+        .with_context(|| format!("Failed to parse response: {}", response_text))?;
+
+    Ok(response.result.priority_fee_levels.very_high as u64)
+}
+
+async fn wait_for_confirmation(
+    rpc_url: &str,
+    signature: &Signature,
+    timeout_duration: Duration,
+) -> Result<bool> {
+    let start = std::time::Instant::now();
+    let client = RpcClient::new(rpc_url.to_string());
+
+    while start.elapsed() < timeout_duration {
+        match client.get_signature_status(signature) {
+            Ok(Some(status)) => {
+                return Ok(status.is_ok());
+            }
+            Ok(None) => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            Err(e) => {
+                eprintln!("Error checking signature status: {}", e);
+                break;
+            }
+        }
+    }
+    Ok(false)
 }
 
 async fn spam_transactions(
@@ -146,16 +183,12 @@ async fn spam_transactions(
 ) -> Option<Signature> {
     let http_client = Client::new();
     let (result_tx, mut result_rx) = mpsc::channel(1);
+    let should_stop = Arc::new(AtomicBool::new(false));
 
     for blockhash in &blockhashes {
         // Create a base transaction to estimate priority fees
-        let base_transaction = create_transaction_with_priority_fee(
-            keypair,
-            &instructions,
-            *blockhash,
-            0, // temporary zero fee for estimation
-        )
-        .await;
+        let base_transaction =
+            create_transaction_with_priority_fee(keypair, &instructions, *blockhash, 0).await;
 
         // Get priority fee estimate
         let priority_fee =
@@ -175,21 +208,43 @@ async fn spam_transactions(
         for rpc_url in &rpc_urls {
             let rpc_url_clone = rpc_url.clone();
             let transaction_clone = transaction.clone();
-            let mut result_tx_clone = result_tx.clone();
+            let result_tx_clone = result_tx.clone();
+            let should_stop_clone = should_stop.clone();
 
             tokio::spawn(async move {
+                // Check if we should stop before sending
+                if should_stop_clone.load(Ordering::Relaxed) {
+                    return;
+                }
+
                 if let Ok(sig) = send_transaction_to_rpc(&rpc_url_clone, transaction_clone).await {
-                    let _ = result_tx_clone.send(sig).await;
+                    // Check if the transaction is confirmed
+                    if let Ok(true) =
+                        wait_for_confirmation(&rpc_url_clone, &sig, Duration::from_secs(30)).await
+                    {
+                        let _ = result_tx_clone.send((sig, true)).await;
+                    } else {
+                        let _ = result_tx_clone.send((sig, false)).await;
+                    }
                 }
             });
         }
     }
     drop(result_tx);
 
-    match timeout(timeout_duration, result_rx.recv()).await {
-        Ok(Some(signature)) => Some(signature),
-        _ => None,
+    let mut confirmed_signature = None;
+
+    while let Ok(Some((signature, is_confirmed))) =
+        timeout(timeout_duration, result_rx.recv()).await
+    {
+        if is_confirmed {
+            confirmed_signature = Some(signature);
+            should_stop.store(true, Ordering::Relaxed);
+            break;
+        }
     }
+
+    confirmed_signature
 }
 
 pub struct TransactionSubmitter {
@@ -237,6 +292,6 @@ impl TransactionSubmitter {
             &self.helius_api_key.clone(),
         )
         .await
-        .ok_or_else(|| anyhow!("Submission timeout"))
+        .context("Failed to submit and confirm transaction within timeout")
     }
 }
