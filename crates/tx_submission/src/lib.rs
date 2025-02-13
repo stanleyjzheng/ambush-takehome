@@ -6,7 +6,6 @@ use sha2::{Digest, Sha256};
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_sdk::instruction::AccountMeta;
-use solana_sdk::message::MessageHeader;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::read_keypair_file;
 use solana_sdk::signer::Signer;
@@ -19,6 +18,7 @@ use solana_sdk::{
     signature::{Keypair, Signature},
     transaction::{Transaction, VersionedTransaction},
 };
+use std::collections::HashSet;
 use std::env;
 use std::error::Error;
 use std::str::FromStr;
@@ -345,98 +345,6 @@ fn instruction_to_compiled(
     }
 }
 
-#[derive(Clone)]
-struct AccountInfo {
-    pubkey: Pubkey,
-    is_signer: bool,
-    is_writable: bool,
-}
-
-fn add_account_meta(account_infos: &mut Vec<AccountInfo>, meta: &AccountMeta) -> u8 {
-    if let Some(pos) = account_infos.iter().position(|a| a.pubkey == meta.pubkey) {
-        // If the account already exists, update its flags if needed.
-        account_infos[pos].is_signer |= meta.is_signer;
-        account_infos[pos].is_writable |= meta.is_writable;
-        pos as u8
-    } else {
-        account_infos.push(AccountInfo {
-            pubkey: meta.pubkey,
-            is_signer: meta.is_signer,
-            is_writable: meta.is_writable,
-        });
-        (account_infos.len() - 1) as u8
-    }
-}
-
-fn instruction_to_compiled_with_metadata(
-    instruction: &Instruction,
-    account_infos: &mut Vec<AccountInfo>,
-) -> CompiledInstruction {
-    let accounts: Vec<u8> = instruction
-        .accounts
-        .iter()
-        .map(|meta| add_account_meta(account_infos, meta))
-        .collect();
-
-    // For the program id, assume it is not a signer and not writable.
-    let program_id_meta = AccountMeta {
-        pubkey: instruction.program_id,
-        is_signer: false,
-        is_writable: false,
-    };
-    let program_id_index = add_account_meta(account_infos, &program_id_meta);
-
-    CompiledInstruction {
-        program_id_index,
-        accounts,
-        data: instruction.data.clone(),
-    }
-}
-
-fn finalize_account_keys_and_header(
-    account_infos: Vec<AccountInfo>,
-) -> (Vec<Pubkey>, MessageHeader) {
-    // Split into signers and non–signers.
-    let mut signers: Vec<AccountInfo> = account_infos
-        .clone()
-        .into_iter()
-        .filter(|a| a.is_signer)
-        .collect();
-    let mut non_signers: Vec<AccountInfo> =
-        account_infos.into_iter().filter(|a| !a.is_signer).collect();
-
-    // Sort signers: writable first, then read–only.
-    signers.sort_by_key(|a| !a.is_writable);
-    // Sort non–signers: writable first, then read–only.
-    non_signers.sort_by_key(|a| !a.is_writable);
-
-    // Concatenate to form the final account keys in order.
-    let ordered_accounts: Vec<AccountInfo> =
-        signers.into_iter().chain(non_signers.into_iter()).collect();
-    let account_keys = ordered_accounts
-        .iter()
-        .map(|a| a.pubkey)
-        .collect::<Vec<_>>();
-
-    let num_required_signatures = ordered_accounts.iter().filter(|a| a.is_signer).count() as u8;
-    let num_readonly_signed_accounts = ordered_accounts
-        .iter()
-        .filter(|a| a.is_signer && !a.is_writable)
-        .count() as u8;
-    let num_readonly_unsigned_accounts = ordered_accounts
-        .iter()
-        .filter(|a| !a.is_signer && !a.is_writable)
-        .count() as u8;
-
-    let header = MessageHeader {
-        num_required_signatures,
-        num_readonly_signed_accounts,
-        num_readonly_unsigned_accounts,
-    };
-
-    (account_keys, header)
-}
-
 async fn spam_versioned_transactions(
     rpc_urls: Vec<String>,
     blockhashes: Vec<Hash>,
@@ -450,10 +358,8 @@ async fn spam_versioned_transactions(
     let should_stop = Arc::new(AtomicBool::new(false));
 
     for blockhash in &blockhashes {
-        // Create a version of the transaction with this blockhash but no priority fee yet
+        // Clone the original transaction and update its blockhash.
         let mut base_tx = original_tx.clone();
-
-        // Update the blockhash
         match &mut base_tx.message {
             VersionedMessage::Legacy(message) => {
                 message.recent_blockhash = *blockhash;
@@ -463,7 +369,7 @@ async fn spam_versioned_transactions(
             }
         }
 
-        // Convert VersionedTransaction to Transaction for priority fee estimation
+        // For priority fee estimation, convert to a legacy Transaction.
         let priority_tx = match &base_tx.message {
             VersionedMessage::Legacy(message) => Transaction::new_unsigned(message.clone()),
             VersionedMessage::V0(message) => {
@@ -473,7 +379,7 @@ async fn spam_versioned_transactions(
                         .iter()
                         .map(|ci| {
                             let program_id = message.account_keys[ci.program_id_index as usize];
-                            let accounts = ci
+                            let accounts: Vec<AccountMeta> = ci
                                 .accounts
                                 .iter()
                                 .map(|&idx| {
@@ -501,7 +407,7 @@ async fn spam_versioned_transactions(
             }
         };
 
-        // Get priority fee estimate using the converted transaction
+        // Get priority fee estimate using the legacy transaction.
         let priority_fee = match get_priority_fee(&http_client, helius_api_key, &priority_tx).await
         {
             Ok(fee) => fee,
@@ -511,128 +417,141 @@ async fn spam_versioned_transactions(
             }
         };
 
-        // Create the final transaction with priority fee
-        let mut final_tx = base_tx.clone();
+        // Build the ComputeBudget instruction to set the priority fee.
         let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(priority_fee);
 
+        // Derive a unique hash for this transaction to be used by the deduper.
         let mut hasher = Sha256::new();
         hasher.update(format!("{:?}", original_tx));
         let original_hash = hasher.finalize();
 
+        // Build deduplication instructions. Note: if the PDA does not exist,
+        // the first instruction will be a system create-account instruction.
         let duplication_ix = build_de_duplication_instructions(
             &keypair.pubkey(),
             original_hash.as_slice(),
             &RpcClient::new(rpc_urls[0].clone()),
-            1,
+            1, // rent_exemption_lamports for 1 byte
         )
         .expect("Failed to build de-duplication instructions");
 
-        // Add priority fee instruction as the first instruction after removing existing ones
-        match &mut final_tx.message {
+        // **** Alternative Approach: Reassemble a fresh message ****
+        //
+        // Instead of modifying the existing message (and its header),
+        // extract the original instructions (by converting from the compiled form),
+        // filter out any pre-existing ComputeBudget instructions, then
+        // build a new instructions vector that includes our new instructions.
+        //
+        // The SDK’s Message::new() function will compute the header correctly.
+        let new_instructions: Vec<Instruction> = match &base_tx.message {
             VersionedMessage::Legacy(message) => {
-                let mut account_infos: Vec<AccountInfo> = message
-                    .account_keys
-                    .iter()
-                    .enumerate()
-                    .map(|(i, key)| {
-                        let is_signer = i < message.header.num_required_signatures as usize;
-                        let is_writable = i
-                            < (message.header.num_required_signatures as usize
-                                - message.header.num_readonly_signed_accounts as usize);
-                        AccountInfo {
-                            pubkey: *key,
-                            is_signer,
-                            is_writable,
-                        }
-                    })
-                    .collect();
+                // Convert compiled instructions back to Instruction objects.
 
-                let filtered_instructions: Vec<CompiledInstruction> = message
-                    .instructions
+                let original_signers: HashSet<Pubkey> = message.account_keys
+                    [0..(message.header.num_required_signatures as usize)]
                     .iter()
-                    .filter(|ci| {
-                        let program_id = message.account_keys[ci.program_id_index as usize];
-                        if program_id == solana_sdk::compute_budget::id() {
-                            ci.data.first().map(|b| *b != 3).unwrap_or(true)
-                        } else {
-                            true
-                        }
-                    })
                     .cloned()
                     .collect();
 
-                let mut new_compiled = vec![instruction_to_compiled_with_metadata(
-                    &priority_fee_ix,
-                    &mut account_infos,
-                )];
-                new_compiled.extend_from_slice(&filtered_instructions);
-                new_compiled.extend(
-                    duplication_ix
-                        .iter()
-                        .map(|ix| instruction_to_compiled_with_metadata(ix, &mut account_infos)),
-                );
+                let orig_instructions: Vec<Instruction> = message
+                    .instructions
+                    .iter()
+                    .map(|ci| {
+                        let program_id = message.account_keys[ci.program_id_index as usize];
+                        let accounts = ci
+                            .accounts
+                            .iter()
+                            .map(|&idx| {
+                                let pubkey = message.account_keys[idx as usize];
+                                // Mark as signer if the pubkey was originally a signer.
+                                let is_signer = original_signers.contains(&pubkey);
+                                let is_writable = message.is_maybe_writable(idx as usize, None);
+                                AccountMeta {
+                                    pubkey,
+                                    is_signer,
+                                    is_writable,
+                                }
+                            })
+                            .collect();
+                        Instruction {
+                            program_id,
+                            accounts,
+                            data: ci.data.clone(),
+                        }
+                    })
+                    .collect();
+                // Remove any old ComputeBudget instructions.
+                let filtered: Vec<Instruction> = orig_instructions
+                    .into_iter()
+                    .filter(|ix| ix.program_id != solana_sdk::compute_budget::id())
+                    .collect();
 
-                let (final_account_keys, new_header) =
-                    finalize_account_keys_and_header(account_infos);
-                message.account_keys = final_account_keys;
-                message.header = new_header;
-                message.instructions = new_compiled;
+                // Build the new instructions:
+                // 1. Our priority fee instruction (which should be executed first),
+                // 2. The original (filtered) instructions,
+                // 3. The deduplication instructions.
+                let mut v = vec![priority_fee_ix];
+                v.extend(filtered);
+                v.extend(duplication_ix);
+                v
             }
             VersionedMessage::V0(message) => {
-                let mut account_infos: Vec<AccountInfo> = message
-                    .account_keys
+                // Same process for a v0 message.
+                let original_signers: HashSet<Pubkey> = message.account_keys
+                    [0..(message.header.num_required_signatures as usize)]
                     .iter()
-                    .enumerate()
-                    .map(|(i, key)| {
-                        let is_signer = i < message.header.num_required_signatures as usize;
-                        let is_writable = i
-                            < (message.header.num_required_signatures as usize
-                                - message.header.num_readonly_signed_accounts as usize);
-                        AccountInfo {
-                            pubkey: *key,
-                            is_signer,
-                            is_writable,
-                        }
-                    })
-                    .collect();
-
-                let filtered_instructions: Vec<CompiledInstruction> = message
-                    .instructions
-                    .iter()
-                    .filter(|ci| {
-                        let program_id = message.account_keys[ci.program_id_index as usize];
-                        if program_id == solana_sdk::compute_budget::id() {
-                            ci.data.first().map(|b| *b != 3).unwrap_or(true)
-                        } else {
-                            true
-                        }
-                    })
                     .cloned()
                     .collect();
 
-                let mut new_compiled = vec![instruction_to_compiled_with_metadata(
-                    &priority_fee_ix,
-                    &mut account_infos,
-                )];
-                new_compiled.extend_from_slice(&filtered_instructions);
-                new_compiled.extend(
-                    duplication_ix
-                        .iter()
-                        .map(|ix| instruction_to_compiled_with_metadata(ix, &mut account_infos)),
-                );
+                let orig_instructions: Vec<Instruction> = message
+                    .instructions
+                    .iter()
+                    .map(|ci| {
+                        let program_id = message.account_keys[ci.program_id_index as usize];
+                        let accounts = ci
+                            .accounts
+                            .iter()
+                            .map(|&idx| {
+                                let pubkey = message.account_keys[idx as usize];
+                                // Mark as signer if the pubkey was originally a signer.
+                                let is_signer = original_signers.contains(&pubkey);
+                                let is_writable = message.is_maybe_writable(idx as usize, None);
+                                AccountMeta {
+                                    pubkey,
+                                    is_signer,
+                                    is_writable,
+                                }
+                            })
+                            .collect();
+                        Instruction {
+                            program_id,
+                            accounts,
+                            data: ci.data.clone(),
+                        }
+                    })
+                    .collect();
 
-                let (final_account_keys, new_header) =
-                    finalize_account_keys_and_header(account_infos);
-                message.account_keys = final_account_keys;
-                message.header = new_header;
-                message.instructions = new_compiled;
+                let filtered: Vec<Instruction> = orig_instructions
+                    .into_iter()
+                    .filter(|ix| ix.program_id != solana_sdk::compute_budget::id())
+                    .collect();
+
+                let mut v = vec![priority_fee_ix];
+                v.extend(filtered);
+                v.extend(duplication_ix);
+                v
             }
-        }
+        };
 
-        // Re-sign the transaction
-        let final_tx =
-            VersionedTransaction::try_new(final_tx.message, &[keypair]).expect("Failed to sign tx");
+        // Create a fresh message from the new instructions.
+        // This will compute the correct MessageHeader (including signer/writable info).
+        let new_message = Message::new(&new_instructions, Some(&keypair.pubkey()));
 
+        println!("new message: {:?}", new_message);
+
+        let final_tx = Transaction::new(&[keypair], new_message, *blockhash);
+
+        // Submit the transaction concurrently to each RPC in the pool.
         for rpc_url in &rpc_urls {
             let rpc_url_clone = rpc_url.clone();
             let tx_clone = final_tx.clone();
@@ -644,7 +563,7 @@ async fn spam_versioned_transactions(
                     return;
                 }
 
-                if let Ok(sig) = send_versioned_transaction_to_rpc(&rpc_url_clone, tx_clone).await {
+                if let Ok(sig) = send_transaction_to_rpc(&rpc_url_clone, tx_clone).await {
                     if let Ok(true) =
                         wait_for_confirmation(&rpc_url_clone, &sig, Duration::from_secs(30)).await
                     {
@@ -657,7 +576,6 @@ async fn spam_versioned_transactions(
         }
     }
 
-    // Rest of the implementation remains the same
     drop(result_tx);
 
     let mut confirmed_signature = None;
@@ -762,4 +680,18 @@ async fn send_versioned_transaction_to_rpc(
     .await?;
 
     result.map_err(|e| e.into())
+}
+
+fn force_single_signer(instructions: Vec<Instruction>, fee_payer: &Pubkey) -> Vec<Instruction> {
+    instructions
+        .into_iter()
+        .map(|mut ix| {
+            // For each account in the instruction, force the is_signer flag to true
+            // only if it matches the fee payer.
+            ix.accounts.iter_mut().for_each(|meta| {
+                meta.is_signer = meta.pubkey == *fee_payer;
+            });
+            ix
+        })
+        .collect()
 }
