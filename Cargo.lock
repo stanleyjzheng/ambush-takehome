@@ -5517,6 +5517,7 @@ dependencies = [
  "rpc_pool",
  "serde",
  "serde_json",
+ "sha2 0.9.9",
  "shellexpand",
  "solana-client",
  "solana-sdk",

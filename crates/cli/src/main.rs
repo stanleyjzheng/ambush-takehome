@@ -8,7 +8,6 @@ use axum::{
 use base64::Engine;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use solana_sdk::instruction::Instruction;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -26,20 +25,6 @@ struct AppState {
 #[derive(Serialize)]
 struct SubmitTransactionResponse {
     signature: String,
-}
-
-#[derive(Deserialize)]
-struct SubmitTransactionRequest {
-    program_id: String,
-    accounts: Vec<AccountMetaRequest>,
-    data: Vec<u8>,
-}
-
-#[derive(Deserialize)]
-struct AccountMetaRequest {
-    pubkey: String,
-    is_signer: bool,
-    is_writable: bool,
 }
 
 #[derive(Deserialize)]
