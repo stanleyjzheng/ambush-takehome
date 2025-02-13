@@ -4,14 +4,17 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSendTransactionConfig;
+use solana_sdk::instruction::AccountMeta;
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::read_keypair_file;
 use solana_sdk::signer::Signer;
 use solana_sdk::{
     compute_budget::ComputeBudgetInstruction,
     hash::Hash,
-    instruction::Instruction,
-    message::Message,
-    signature::{read_keypair_file, Keypair, Signature},
-    transaction::Transaction,
+    instruction::{CompiledInstruction, Instruction},
+    message::{v0, Message, VersionedMessage},
+    signature::{Keypair, Signature},
+    transaction::{Transaction, VersionedTransaction},
 };
 use std::env;
 use std::error::Error;
@@ -95,7 +98,7 @@ async fn send_transaction_to_rpc(
     let result = tokio::task::spawn_blocking(move || {
         let client = RpcClient::new(rpc_url);
         let config = RpcSendTransactionConfig {
-            skip_preflight: true,
+            skip_preflight: false,
             preflight_commitment: None,
             ..Default::default()
         };
@@ -268,7 +271,10 @@ impl TransactionSubmitter {
         })
     }
 
-    pub async fn submit_transaction(&self, instructions: Vec<Instruction>) -> Result<Signature> {
+    pub async fn submit_versioned_transaction(
+        &self,
+        original_tx: solana_sdk::transaction::VersionedTransaction,
+    ) -> Result<Signature> {
         let blockhashes: Vec<Hash> = {
             let cache = self.rpc_pool.cache.lock().unwrap();
             cache
@@ -283,15 +289,238 @@ impl TransactionSubmitter {
             tracker.get_sorted_rpcs()
         };
 
-        spam_transactions(
+        spam_versioned_transactions(
             rpc_urls,
             blockhashes,
+            original_tx,
             &self.keypair,
-            instructions,
             Duration::from_secs(30),
-            &self.helius_api_key.clone(),
+            &self.helius_api_key,
         )
         .await
-        .context("Failed to submit and confirm transaction within timeout")
+        .context("Failed to submit and confirm transaction")
     }
+}
+
+fn instruction_to_compiled(
+    instruction: &Instruction,
+    account_keys: &[Pubkey],
+) -> CompiledInstruction {
+    let accounts: Vec<u8> = instruction
+        .accounts
+        .iter()
+        .map(|meta| {
+            account_keys
+                .iter()
+                .position(|key| key == &meta.pubkey)
+                .unwrap() as u8
+        })
+        .collect();
+
+    let program_id_index = account_keys
+        .iter()
+        .position(|key| key == &instruction.program_id)
+        .unwrap() as u8;
+
+    CompiledInstruction {
+        program_id_index,
+        accounts,
+        data: instruction.data.clone(),
+    }
+}
+
+async fn spam_versioned_transactions(
+    rpc_urls: Vec<String>,
+    blockhashes: Vec<Hash>,
+    original_tx: VersionedTransaction,
+    keypair: &Keypair,
+    timeout_duration: Duration,
+    helius_api_key: &str,
+) -> Option<Signature> {
+    let http_client = Client::new();
+    let (result_tx, mut result_rx) = mpsc::channel(1);
+    let should_stop = Arc::new(AtomicBool::new(false));
+
+    for blockhash in &blockhashes {
+        // Create a version of the transaction with this blockhash but no priority fee yet
+        let mut base_tx = original_tx.clone();
+
+        // Update the blockhash
+        match &mut base_tx.message {
+            VersionedMessage::Legacy(message) => {
+                message.recent_blockhash = *blockhash;
+            }
+            VersionedMessage::V0(message) => {
+                message.recent_blockhash = *blockhash;
+            }
+        }
+
+        // Convert VersionedTransaction to Transaction for priority fee estimation
+        let priority_tx = match &base_tx.message {
+            VersionedMessage::Legacy(message) => Transaction::new_unsigned(message.clone()),
+            VersionedMessage::V0(message) => {
+                let legacy_message = Message::new(
+                    &message
+                        .instructions
+                        .iter()
+                        .map(|ci| {
+                            let program_id = message.account_keys[ci.program_id_index as usize];
+                            let accounts = ci
+                                .accounts
+                                .iter()
+                                .map(|&idx| {
+                                    let pubkey = message.account_keys[idx as usize];
+                                    let is_signer = (idx as usize)
+                                        < message.header.num_required_signatures as usize;
+                                    let is_writable = message.is_maybe_writable(idx as usize, None);
+                                    AccountMeta {
+                                        pubkey,
+                                        is_signer,
+                                        is_writable,
+                                    }
+                                })
+                                .collect();
+                            Instruction {
+                                program_id,
+                                accounts,
+                                data: ci.data.clone(),
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                    Some(&message.account_keys[0]),
+                );
+                Transaction::new_unsigned(legacy_message)
+            }
+        };
+
+        // Get priority fee estimate using the converted transaction
+        let priority_fee = match get_priority_fee(&http_client, helius_api_key, &priority_tx).await
+        {
+            Ok(fee) => fee,
+            Err(e) => {
+                eprintln!("Failed to get priority fee: {}", e);
+                continue;
+            }
+        };
+
+        // Create the final transaction with priority fee
+        let mut final_tx = base_tx.clone();
+        let mut final_tx = base_tx.clone();
+        let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(priority_fee);
+
+        // Add priority fee instruction as the first instruction after removing existing ones
+        match &mut final_tx.message {
+            VersionedMessage::Legacy(message) => {
+                let account_keys = message.account_keys.clone();
+
+                // Filter out existing SetComputeUnitPrice instructions
+                let filtered_instructions: Vec<CompiledInstruction> = message
+                    .instructions
+                    .iter()
+                    .filter(|ci| {
+                        let program_id = account_keys[ci.program_id_index as usize];
+                        if program_id == solana_sdk::compute_budget::id() {
+                            // Check if the instruction is SetComputeUnitPrice (discriminator 3)
+                            ci.data.first().map(|b| *b != 3).unwrap_or(true)
+                        } else {
+                            true
+                        }
+                    })
+                    .cloned()
+                    .collect();
+
+                let mut new_instructions =
+                    vec![instruction_to_compiled(&priority_fee_ix, &account_keys)];
+                new_instructions.extend_from_slice(&filtered_instructions);
+
+                message.instructions = new_instructions;
+            }
+            VersionedMessage::V0(message) => {
+                let account_keys = message.account_keys.clone();
+
+                // Filter out existing SetComputeUnitPrice instructions
+                let filtered_instructions: Vec<CompiledInstruction> = message
+                    .instructions
+                    .iter()
+                    .filter(|ci| {
+                        let program_id = account_keys[ci.program_id_index as usize];
+                        if program_id == solana_sdk::compute_budget::id() {
+                            ci.data.first().map(|b| *b != 3).unwrap_or(true)
+                        } else {
+                            true
+                        }
+                    })
+                    .cloned()
+                    .collect();
+
+                let mut new_instructions =
+                    vec![instruction_to_compiled(&priority_fee_ix, &account_keys)];
+                new_instructions.extend_from_slice(&filtered_instructions);
+
+                message.instructions = new_instructions;
+            }
+        }
+
+        let final_tx =
+            VersionedTransaction::try_new(final_tx.message, &[keypair]).expect("Failed to sign tx");
+
+        for rpc_url in &rpc_urls {
+            let rpc_url_clone = rpc_url.clone();
+            let tx_clone = final_tx.clone();
+            let result_tx_clone = result_tx.clone();
+            let should_stop_clone = should_stop.clone();
+
+            tokio::spawn(async move {
+                if should_stop_clone.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                if let Ok(sig) = send_versioned_transaction_to_rpc(&rpc_url_clone, tx_clone).await {
+                    if let Ok(true) =
+                        wait_for_confirmation(&rpc_url_clone, &sig, Duration::from_secs(30)).await
+                    {
+                        let _ = result_tx_clone.send((sig, true)).await;
+                    } else {
+                        let _ = result_tx_clone.send((sig, false)).await;
+                    }
+                }
+            });
+        }
+    }
+
+    // Rest of the implementation remains the same
+    drop(result_tx);
+
+    let mut confirmed_signature = None;
+    while let Ok(Some((signature, is_confirmed))) =
+        timeout(timeout_duration, result_rx.recv()).await
+    {
+        if is_confirmed {
+            confirmed_signature = Some(signature);
+            should_stop.store(true, Ordering::Relaxed);
+            break;
+        }
+    }
+
+    confirmed_signature
+}
+
+async fn send_versioned_transaction_to_rpc(
+    rpc_url: &str,
+    transaction: VersionedTransaction,
+) -> Result<Signature, Box<dyn Error + Send + Sync>> {
+    let rpc_url = rpc_url.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = RpcClient::new(rpc_url);
+        let config = RpcSendTransactionConfig {
+            skip_preflight: false,
+            preflight_commitment: None,
+            // Remove the encoding configuration since it's not needed
+            ..Default::default()
+        };
+        client.send_transaction_with_config(&transaction, config)
+    })
+    .await?;
+
+    result.map_err(|e| e.into())
 }

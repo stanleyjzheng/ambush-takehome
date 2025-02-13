@@ -57,7 +57,6 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let app = Router::new()
         .route("/health", get(health_check))
-        .route("/submit", post(handle_submit_transaction))
         .route("/submit_base64", post(handle_submit_base64_transaction)) // New endpoint
         .with_state(AppState { tx_submitter });
 
@@ -70,55 +69,6 @@ async fn main() -> Result<(), anyhow::Error> {
 
 async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, "OK")
-}
-
-async fn handle_submit_transaction(
-    AxumState(state): AxumState<AppState>,
-    Json(payload): Json<SubmitTransactionRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let program_id = payload.program_id.parse().map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid program ID: {}", e),
-        )
-    })?;
-
-    let accounts = payload
-        .accounts
-        .into_iter()
-        .map(|acc| {
-            acc.pubkey
-                .parse()
-                .map(|pubkey| solana_sdk::instruction::AccountMeta {
-                    pubkey,
-                    is_signer: acc.is_signer,
-                    is_writable: acc.is_writable,
-                })
-                .map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("Invalid account pubkey: {}", e),
-                    )
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let instruction = Instruction {
-        program_id,
-        accounts,
-        data: payload.data,
-    };
-
-    state
-        .tx_submitter
-        .submit_transaction(vec![instruction])
-        .await
-        .map(|sig| {
-            Json(SubmitTransactionResponse {
-                signature: sig.to_string(),
-            })
-        })
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 async fn handle_submit_base64_transaction(
@@ -134,94 +84,19 @@ async fn handle_submit_base64_transaction(
                 format!("Invalid base64 encoding: {}", e),
             )
         })?;
-    eprintln!("Decoded bytes length: {}", tx_bytes.len());
 
-    // Deserialize as a VersionedTransaction
     let versioned_tx: solana_sdk::transaction::VersionedTransaction =
         bincode::deserialize(&tx_bytes).map_err(|e| {
             eprintln!("Bincode deserialize error: {:?}", e);
-            eprintln!(
-                "First few bytes: {:?}",
-                &tx_bytes[..std::cmp::min(tx_bytes.len(), 16)]
-            );
             (
                 StatusCode::BAD_REQUEST,
                 format!("Failed to deserialize transaction: {}", e),
             )
         })?;
 
-    // Extract instructions from the VersionedMessage field.
-    // For both Legacy and V0 messages, we determine:
-    // - is_signer: by checking if the account index is less than num_required_signatures.
-    // - is_writable: using is_maybe_writable.
-    let instructions: Vec<solana_sdk::instruction::Instruction> = match &versioned_tx.message {
-        solana_sdk::message::VersionedMessage::Legacy(message) => {
-            message
-                .instructions
-                .iter()
-                .map(|instr| {
-                    let program_id = message.account_keys[instr.program_id_index as usize];
-                    let accounts = instr
-                        .accounts
-                        .iter()
-                        .map(|&index| {
-                            let pubkey = message.account_keys[index as usize];
-                            // For both legacy and v0 messages, the first `num_required_signatures`
-                            // in account_keys are signers.
-                            let is_signer = (index as usize)
-                                < (message.header.num_required_signatures as usize);
-                            let is_writable = message.is_maybe_writable(index as usize, None);
-                            solana_sdk::instruction::AccountMeta {
-                                pubkey,
-                                is_signer,
-                                is_writable,
-                            }
-                        })
-                        .collect();
-                    solana_sdk::instruction::Instruction {
-                        program_id,
-                        accounts,
-                        data: instr.data.clone(),
-                    }
-                })
-                .collect()
-        }
-        solana_sdk::message::VersionedMessage::V0(message_v0) => {
-            message_v0
-                .instructions
-                .iter()
-                .map(|instr| {
-                    let program_id = message_v0.account_keys[instr.program_id_index as usize];
-                    let accounts = instr
-                        .accounts
-                        .iter()
-                        .map(|&index| {
-                            let pubkey = message_v0.account_keys[index as usize];
-                            // In a V0 message, the ordering is the same:
-                            let is_signer = (index as usize)
-                                < (message_v0.header.num_required_signatures as usize);
-                            let is_writable = message_v0.is_maybe_writable(index as usize, None);
-                            solana_sdk::instruction::AccountMeta {
-                                pubkey,
-                                is_signer,
-                                is_writable,
-                            }
-                        })
-                        .collect();
-                    solana_sdk::instruction::Instruction {
-                        program_id,
-                        accounts,
-                        data: instr.data.clone(),
-                    }
-                })
-                .collect()
-        }
-    };
-
-    // Submit the transaction instructions
     let signature = state
         .tx_submitter
-        .submit_transaction(instructions)
+        .submit_versioned_transaction(versioned_tx)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
